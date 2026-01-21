@@ -1,7 +1,4 @@
 require("dotenv").config();
-
-const { extractBattleId, getGuildPlayersFromBattle } = require("./albionbb");
-
 const {
   Client,
   GatewayIntentBits,
@@ -9,7 +6,7 @@ const {
   PermissionsBitField,
 } = require("discord.js");
 
-const PREFIX = process.env.PREFIX || "!";
+const PREFIX = process.env.PREFIX || "$";
 const TOKEN = process.env.DISCORD_TOKEN;
 const DEFAULT_GUILD_NAME = "Romania Mare";
 
@@ -64,30 +61,121 @@ function similarity(a, b) {
   return 1 - levenshtein(a, b) / Math.max(a.length, b.length);
 }
 
-async function fetchBattle(battleId) {
-  const res = await fetch(
-    `https://gameinfo-ams.albiononline.com/api/gameinfo/battles/${battleId}`,
-  );
-  if (!res.ok) throw new Error(`Albion API failed (${res.status})`);
-  return res.json();
+// ===== ALBIONBB + NUXT HELPERS =====
+function extractBattleId(input) {
+  const s = String(input || "").trim();
+  const m = s.match(/\/battles\/(\d+)/i);
+  if (m) return m[1];
+  if (/^\d+$/.test(s)) return s;
+  return null;
 }
 
-function extractGuildPlayers(battle, guildName) {
-  const out = [];
-  if (!battle.players) return out;
-  for (const p of Object.values(battle.players)) {
-    if (p.GuildName?.toLowerCase() === guildName.toLowerCase()) {
-      out.push(p.Name);
+function norm(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase();
+}
+
+async function fetchBattleHtml(battleId) {
+  const url = `https://europe.albionbb.com/battles/${battleId}`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      Accept: "text/html",
+    },
+  });
+  if (!res.ok) throw new Error(`AlbionBB HTTP ${res.status}`);
+  return res.text();
+}
+
+function extractNuxtArrayFromHtml(html) {
+  const re = /<script[^>]*id="__NUXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i;
+  const m = html.match(re);
+  if (!m) throw new Error("Could not find __NUXT_DATA__ in HTML");
+  const jsonText = m[1].trim();
+  const parsed = JSON.parse(jsonText);
+  if (!Array.isArray(parsed))
+    throw new Error("__NUXT_DATA__ did not parse into an array");
+  return parsed;
+}
+
+function makeResolver(arr) {
+  const resolve = (v) => {
+    if (typeof v === "number" && v >= 0 && v < arr.length) return arr[v];
+    return v;
+  };
+
+  const deepResolve = (v, depth = 0) => {
+    if (depth > 6) return v; // safety
+    const r = resolve(v);
+
+    if (Array.isArray(r)) return r.map((x) => deepResolve(x, depth + 1));
+    if (r && typeof r === "object") {
+      const out = {};
+      for (const [k, val] of Object.entries(r)) {
+        out[k] = deepResolve(val, depth + 1);
+      }
+      return out;
     }
-  }
-  return [...new Set(out)];
+    return r;
+  };
+
+  return { resolve, deepResolve };
 }
 
+function findBattleRoot(arr) {
+  for (const item of arr) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+
+    const hasPlayers = Object.prototype.hasOwnProperty.call(item, "players");
+    const hasGuilds = Object.prototype.hasOwnProperty.call(item, "guilds");
+    const hasTotalPlayers = Object.prototype.hasOwnProperty.call(
+      item,
+      "totalPlayers",
+    );
+
+    if (hasPlayers && hasGuilds && hasTotalPlayers) return item;
+  }
+  throw new Error("Could not locate battle root object in Nuxt data");
+}
+
+function extractGuildPlayersFromNuxt(arr, guildName) {
+  const { deepResolve } = makeResolver(arr);
+  const battleRoot = findBattleRoot(arr);
+
+  const playersList = deepResolve(battleRoot.players);
+  if (!Array.isArray(playersList))
+    throw new Error("battleRoot.players did not resolve to an array");
+
+  const target = norm(guildName);
+  const names = [];
+
+  for (const entry of playersList) {
+    const p = deepResolve(entry);
+    if (!p || typeof p !== "object") continue;
+
+    if (norm(p.guildName) !== target) continue;
+
+    const name = String(p.name || "").trim();
+    if (name) names.push(name);
+  }
+
+  // Clean + de-dupe (prevents Deskra twice / blanks)
+  return [...new Set(names.map((n) => n.trim()).filter(Boolean))];
+}
+
+async function getGuildPlayersFromBattle(battleId, guildName) {
+  const html = await fetchBattleHtml(battleId);
+  const nuxtArr = extractNuxtArrayFromHtml(html);
+  return extractGuildPlayersFromNuxt(nuxtArr, guildName);
+}
+
+// ===== BOT READY =====
 client.once("ready", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-// handlerr
+// ===== MESSAGE HANDLER =====
 client.on("messageCreate", async (message) => {
   try {
     if (!message.guild || message.author.bot) return;
@@ -96,6 +184,7 @@ client.on("messageCreate", async (message) => {
     const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
     const cmd = args.shift()?.toLowerCase();
 
+    // Permission checks (role commands and ping-guild both need Manage Roles in your setup)
     if (
       !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles)
     ) {
@@ -107,7 +196,9 @@ client.on("messageCreate", async (message) => {
       return message.reply("❌ I need **Manage Roles**.");
     }
 
-    // add roles to mentioned members
+    // ===============================
+    // ADD ROLE TO MULTIPLE USERS
+    // ===============================
     if (cmd === "add-role") {
       const role = message.mentions.roles.first();
       const members = message.mentions.members;
@@ -134,7 +225,9 @@ client.on("messageCreate", async (message) => {
       return message.channel.send(`✅ Added role to ${added} users.`);
     }
 
-    // clear roles from ALL members
+    // ===============================
+    // CLEAR ROLE FROM EVERYONE
+    // ===============================
     if (cmd === "clear-role") {
       const role = message.mentions.roles.first();
       if (!role) {
@@ -156,7 +249,9 @@ client.on("messageCreate", async (message) => {
       );
     }
 
-    // ping guild doesn't work because idk why
+    // ===============================
+    // PING-GUILD (TEST MODE: NAMES ONLY)
+    // ===============================
     if (cmd === "ping-guild") {
       const battleInput = args[0];
       const guildName = args.slice(1).join(" ") || DEFAULT_GUILD_NAME;
@@ -174,16 +269,20 @@ client.on("messageCreate", async (message) => {
         `Fetching Nuxt data for battle **${battleId}** (guild: **${guildName}**)…`,
       );
 
+      // Always local variables (prevents accumulating repeats across runs)
       let albionNames;
       try {
         albionNames = await getGuildPlayersFromBattle(battleId, guildName);
       } catch (e) {
-        return message.channel.send(
-          `❌ Failed to fetch/parse Nuxt data: ${e.message}`,
-        );
+        return message.channel.send(`❌ Nuxt parse error: ${e.message}`);
       }
 
-      if (!albionNames || albionNames.length === 0) {
+      // Clean again just in case
+      albionNames = [
+        ...new Set(albionNames.map((n) => String(n).trim()).filter(Boolean)),
+      ];
+
+      if (albionNames.length === 0) {
         return message.channel.send(
           `❌ No players found for **${guildName}** in Nuxt data.`,
         );
@@ -191,11 +290,12 @@ client.on("messageCreate", async (message) => {
 
       const members = await message.guild.members.fetch();
 
+      // Matching settings
       const threshold = 0.86;
       const ambGap = 0.06;
 
-      const matched = new Map(); // albionName -> GuildMember
       const problems = [];
+      const matched = new Map(); // albionName -> GuildMember
       const usedMemberIds = new Set();
 
       for (const name of albionNames) {
@@ -203,13 +303,32 @@ client.on("messageCreate", async (message) => {
         let bestScore = 0;
         let secondScore = 0;
 
+        const nn = normalize(name);
+
         for (const m of members.values()) {
           if (usedMemberIds.has(m.id)) continue;
 
+          const nick = m?.nickname ?? "";
+          const gname = m?.user?.globalName ?? "";
+          const uname = m?.user?.username ?? "";
+
+          // Exact normalized match shortcut
+          if (
+            nn &&
+            (normalize(nick) === nn ||
+              normalize(gname) === nn ||
+              normalize(uname) === nn)
+          ) {
+            best = m;
+            bestScore = 1;
+            secondScore = 0;
+            break;
+          }
+
           const score = Math.max(
-            similarity(name, m.nickname),
-            similarity(name, m.user.globalName),
-            similarity(name, m.user.username),
+            similarity(name, nick),
+            similarity(name, gname),
+            similarity(name, uname),
           );
 
           if (score > bestScore) {
@@ -234,19 +353,25 @@ client.on("messageCreate", async (message) => {
         usedMemberIds.add(best.id);
       }
 
-      // STRICT: if any mismatch, do NOT output mapped list
+      // STRICT MODE: no mapped list if any problems
       if (problems.length > 0 || matched.size !== albionNames.length) {
+        const uniqueProblems = [...new Set(problems.filter(Boolean))];
+
+        const extracted = albionNames.length;
+        const matchedCount = matched.size;
+        const missing = extracted - matchedCount;
+
         let out =
           `❌ **Strict mode: no mapped list produced.**\n` +
           `Battle: **${battleId}** | Guild: **${guildName}**\n` +
-          `Extracted: **${albionNames.length}** | Matched: **${matched.size}**\n\n` +
-          `**Problems:**\n- ${problems.join("\n- ")}`;
+          `Extracted: **${extracted}** | Matched: **${matchedCount}** | Missing: **${missing}**\n\n` +
+          `**Problems (${uniqueProblems.length}):**\n- ${uniqueProblems.join("\n- ")}`;
 
         if (out.length > 1900) out = out.slice(0, 1900) + "\n…(truncated)";
         return message.channel.send(out);
       }
 
-      // ONE message, names only (no @mentions yet)
+      // ONE MESSAGE OUTPUT — names only (no @mentions yet)
       const lines = albionNames.map((albion) => {
         const m = matched.get(albion);
         return `${m.displayName} (Albion: ${albion})`;
@@ -261,8 +386,9 @@ client.on("messageCreate", async (message) => {
       return message.channel.send(out);
     }
   } catch (e) {
+    console.error("ERROR:", e?.message);
     console.error(e);
-    message.channel.send("❌ Error. Check console.");
+    return message.channel.send("❌ Error. Check console.");
   }
 });
 
