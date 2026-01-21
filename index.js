@@ -1,4 +1,7 @@
 require("dotenv").config();
+
+const { extractBattleId, getGuildPlayersFromBattle } = require("./albionbb");
+
 const {
   Client,
   GatewayIntentBits,
@@ -59,11 +62,6 @@ function similarity(a, b) {
   if (a === b) return 1;
   if (a.includes(b) || b.includes(a)) return 0.92;
   return 1 - levenshtein(a, b) / Math.max(a.length, b.length);
-}
-
-function extractBattleId(input) {
-  const m = String(input).match(/battles\/(\d+)/);
-  return m ? m[1] : /^\d+$/.test(input) ? input : null;
 }
 
 async function fetchBattle(battleId) {
@@ -170,28 +168,44 @@ client.on("messageCreate", async (message) => {
       }
 
       const battleId = extractBattleId(battleInput);
-      if (!battleId) {
-        return message.reply("❌ Invalid battle link or ID.");
+      if (!battleId) return message.reply("❌ Invalid battle link or ID.");
+
+      await message.reply(
+        `Fetching Nuxt data for battle **${battleId}** (guild: **${guildName}**)…`,
+      );
+
+      let albionNames;
+      try {
+        albionNames = await getGuildPlayersFromBattle(battleId, guildName);
+      } catch (e) {
+        return message.channel.send(
+          `❌ Failed to fetch/parse Nuxt data: ${e.message}`,
+        );
       }
 
-      const battle = await fetchBattle(battleId);
-      const albionNames = extractGuildPlayers(battle, guildName);
-
-      if (albionNames.length === 0) {
+      if (!albionNames || albionNames.length === 0) {
         return message.channel.send(
-          `❌ No players found for **${guildName}**.`,
+          `❌ No players found for **${guildName}** in Nuxt data.`,
         );
       }
 
       const members = await message.guild.members.fetch();
-      const unmatched = [];
-      const matched = new Map();
+
+      const threshold = 0.86;
+      const ambGap = 0.06;
+
+      const matched = new Map(); // albionName -> GuildMember
+      const problems = [];
+      const usedMemberIds = new Set();
 
       for (const name of albionNames) {
         let best = null;
         let bestScore = 0;
+        let secondScore = 0;
 
         for (const m of members.values()) {
+          if (usedMemberIds.has(m.id)) continue;
+
           const score = Math.max(
             similarity(name, m.nickname),
             similarity(name, m.user.globalName),
@@ -199,34 +213,52 @@ client.on("messageCreate", async (message) => {
           );
 
           if (score > bestScore) {
+            secondScore = bestScore;
             bestScore = score;
             best = m;
+          } else if (score > secondScore) {
+            secondScore = score;
           }
         }
 
-        if (bestScore < 0.86) {
-          unmatched.push(name);
-        } else {
-          matched.set(name, best);
+        if (!best || bestScore < threshold) {
+          problems.push(`Unmatched: ${name}`);
+          continue;
         }
+        if (bestScore - secondScore < ambGap) {
+          problems.push(`Ambiguous: ${name}`);
+          continue;
+        }
+
+        matched.set(name, best);
+        usedMemberIds.add(best.id);
       }
 
-      if (unmatched.length > 0) {
-        return message.channel.send(
-          `❌ **No pings sent.** Unmatched players:\n- ${unmatched.join(
-            "\n- ",
-          )}`,
-        );
+      // STRICT: if any mismatch, do NOT output mapped list
+      if (problems.length > 0 || matched.size !== albionNames.length) {
+        let out =
+          `❌ **Strict mode: no mapped list produced.**\n` +
+          `Battle: **${battleId}** | Guild: **${guildName}**\n` +
+          `Extracted: **${albionNames.length}** | Matched: **${matched.size}**\n\n` +
+          `**Problems:**\n- ${problems.join("\n- ")}`;
+
+        if (out.length > 1900) out = out.slice(0, 1900) + "\n…(truncated)";
+        return message.channel.send(out);
       }
 
-      await message.channel.send(
-        `✅ All matched. Pinging ${matched.size} players...`,
-      );
+      // ONE message, names only (no @mentions yet)
+      const lines = albionNames.map((albion) => {
+        const m = matched.get(albion);
+        return `${m.displayName} (Albion: ${albion})`;
+      });
 
-      for (const [name, member] of matched.entries()) {
-        await message.channel.send(`🔔 ${member} (**${name}**)`);
-        await sleep(1200);
-      }
+      let out =
+        `✅ All matched (names only).\n` +
+        `Battle: **${battleId}** | Guild: **${guildName}** | Count: **${lines.length}**\n\n` +
+        lines.join("\n");
+
+      if (out.length > 1900) out = out.slice(0, 1900) + "\n…(truncated)";
+      return message.channel.send(out);
     }
   } catch (e) {
     console.error(e);
