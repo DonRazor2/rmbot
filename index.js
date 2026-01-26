@@ -32,6 +32,12 @@ function normalize(s) {
   return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function norm(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase();
+}
+
 function levenshtein(a, b) {
   const dp = Array(b.length + 1)
     .fill(0)
@@ -61,19 +67,28 @@ function similarity(a, b) {
   return 1 - levenshtein(a, b) / Math.max(a.length, b.length);
 }
 
-// ===== ALBIONBB + NUXT HELPERS =====
-function extractBattleId(input) {
+function extractBattleIds(input) {
   const s = String(input || "").trim();
-  const m = s.match(/\/battles\/(\d+)/i);
-  if (m) return m[1];
-  if (/^\d+$/.test(s)) return s;
-  return null;
-}
 
-function norm(s) {
-  return String(s || "")
-    .trim()
-    .toLowerCase();
+  // 1) Multi URL: /battles/multi?ids=1,2,3
+  const multi = s.match(/\/battles\/multi\?[^#]*\bids=([0-9,]+)/i);
+  if (multi) {
+    return multi[1]
+      .split(",")
+      .map((x) => x.trim())
+      .filter((x) => /^\d+$/.test(x));
+  }
+
+  // 2) Single URL: /battles/<id>
+  const single = s.match(/\/battles\/(\d+)/i);
+  if (single) return [single[1]];
+
+  // 3) Raw "id,id,id" or "id"
+  if (/^\d+(,\d+)*$/.test(s)) {
+    return s.split(",").map((x) => x.trim());
+  }
+
+  return null;
 }
 
 async function fetchBattleHtml(battleId) {
@@ -170,6 +185,17 @@ async function getGuildPlayersFromBattle(battleId, guildName) {
   return extractGuildPlayersFromNuxt(nuxtArr, guildName);
 }
 
+async function getGuildPlayersFromBattles(battleIds, guildName) {
+  const out = new Set();
+
+  for (const id of battleIds) {
+    const names = await getGuildPlayersFromBattle(id, guildName); // uses Nuxt parse
+    for (const n of names) out.add(String(n).trim());
+  }
+
+  return [...out].filter(Boolean);
+}
+
 // ===== BOT READY =====
 client.once("ready", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
@@ -184,7 +210,7 @@ client.on("messageCreate", async (message) => {
     const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
     const cmd = args.shift()?.toLowerCase();
 
-    // Permission checks (role commands and ping-guild both need Manage Roles in your setup)
+    // Permission checks (role commands and map-bb both need Manage Roles in your setup)
     if (
       !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles)
     ) {
@@ -250,29 +276,36 @@ client.on("messageCreate", async (message) => {
     }
 
     // ===============================
-    // PING-GUILD (TEST MODE: NAMES ONLY)
+    // MAP-BB (Maps names from AlbionBB battle to Discord members, then send a message with the results)
     // ===============================
-    if (cmd === "ping-guild") {
+    if (cmd === "map-bb") {
       const battleInput = args[0];
       const guildName = args.slice(1).join(" ") || DEFAULT_GUILD_NAME;
 
       if (!battleInput) {
         return message.reply(
-          `Usage: \`${PREFIX}ping-guild <albionbb link> [guild name]\``,
+          `Usage: \`${PREFIX}map-bb <albionbb link> [guild name]\``,
         );
       }
 
-      const battleId = extractBattleId(battleInput);
-      if (!battleId) return message.reply("❌ Invalid battle link or ID.");
+      const battleIds = extractBattleIds(battleInput);
+      if (!battleIds || battleIds.length === 0) {
+        return message.reply("❌ Invalid battle link or ID.");
+      }
+
+      const battleLabel =
+        battleIds.length === 1
+          ? battleIds[0]
+          : `multi (${battleIds.length} battles)`;
 
       await message.reply(
-        `Fetching Nuxt data for battle **${battleId}** (guild: **${guildName}**)…`,
+        `Fetching Nuxt data for **${battleLabel}** (guild: **${guildName}**)…`,
       );
 
       // Always local variables (prevents accumulating repeats across runs)
       let albionNames;
       try {
-        albionNames = await getGuildPlayersFromBattle(battleId, guildName);
+        albionNames = await getGuildPlayersFromBattles(battleIds, guildName);
       } catch (e) {
         return message.channel.send(`❌ Nuxt parse error: ${e.message}`);
       }
@@ -363,7 +396,7 @@ client.on("messageCreate", async (message) => {
 
         let out =
           `❌ **Strict mode: no mapped list produced.**\n` +
-          `Battle: **${battleId}** | Guild: **${guildName}**\n` +
+          `Battle: **${battleLabel}** | Guild: **${guildName}**\n` +
           `Extracted: **${extracted}** | Matched: **${matchedCount}** | Missing: **${missing}**\n\n` +
           `**Problems (${uniqueProblems.length}):**\n- ${uniqueProblems.join("\n- ")}`;
 
@@ -379,11 +412,179 @@ client.on("messageCreate", async (message) => {
 
       let out =
         `✅ All matched (names only).\n` +
-        `Battle: **${battleId}** | Guild: **${guildName}** | Count: **${lines.length}**\n\n` +
+        `Battle: **${battleLabel}** | Guild: **${guildName}** | Count: **${lines.length}**\n\n` +
         lines.join("\n");
 
       if (out.length > 1900) out = out.slice(0, 1900) + "\n…(truncated)";
       return message.channel.send(out);
+    }
+
+    // ===============================
+    // MAP-BB + ADD ROLE (STRICT)
+    // Usage: ?map-bb-add-role <albionbb link> @Role [guild name optional]
+    // Example: ?map-bb-add-role https://europe.albionbb.com/battles/313321164 @pay1
+    // ===============================
+    if (cmd === "map-bb-add-role") {
+      const battleInput = args[0];
+      const role = message.mentions.roles.first();
+
+      // Optional: allow guild name after role, e.g. ?map-bb-add-role <link> @Role Romania Mare
+      const guildName =
+        args
+          .slice(1)
+          .filter((x) => !x.startsWith("<@&"))
+          .join(" ")
+          .trim() || DEFAULT_GUILD_NAME;
+
+      if (!battleInput || !role) {
+        return message.reply(
+          `Usage: \`${PREFIX}map-bb-add-role <albionbb link> @Role [guild name]\``,
+        );
+      }
+
+      const battleIds = extractBattleIds(battleInput);
+      if (!battleIds || battleIds.length === 0) {
+        return message.reply("❌ Invalid battle link or ID.");
+      }
+
+      const battleLabel =
+        battleIds.length === 1
+          ? battleIds[0]
+          : `multi (${battleIds.length} battles)`;
+
+      // Bot role hierarchy check
+      const me = await message.guild.members.fetchMe();
+      if (role.position >= me.roles.highest.position) {
+        return message.reply(
+          "❌ That role is above (or equal to) my highest role.",
+        );
+      }
+
+      await message.reply(
+        `Mapping **${battleLabel}** for guild **${guildName}**, then adding role **${role.name}**…`,
+      );
+
+      // 1) Extract Albion names from Nuxt (merged across battles)
+      let albionNames;
+      try {
+        albionNames = await getGuildPlayersFromBattles(battleIds, guildName);
+      } catch (e) {
+        return message.channel.send(`❌ Nuxt parse error: ${e.message}`);
+      }
+
+      // Clean + dedupe (prevents duplicates like Deskra twice)
+      albionNames = [
+        ...new Set(albionNames.map((n) => String(n).trim()).filter(Boolean)),
+      ];
+
+      if (albionNames.length === 0) {
+        return message.channel.send(
+          `❌ No players found for **${guildName}** in Nuxt data.`,
+        );
+      }
+
+      // 2) Fetch Discord members
+      const members = await message.guild.members.fetch();
+
+      // 3) Strict match
+      const threshold = 0.86;
+      const ambGap = 0.06;
+
+      const problems = [];
+      const matched = new Map(); // albionName -> GuildMember
+      const usedMemberIds = new Set();
+
+      for (const name of albionNames) {
+        let best = null;
+        let bestScore = 0;
+        let secondScore = 0;
+
+        const nn = normalize(name);
+
+        for (const m of members.values()) {
+          if (usedMemberIds.has(m.id)) continue;
+
+          const nick = m?.nickname ?? "";
+          const gname = m?.user?.globalName ?? "";
+          const uname = m?.user?.username ?? "";
+
+          // Exact normalized match shortcut
+          if (
+            nn &&
+            (normalize(nick) === nn ||
+              normalize(gname) === nn ||
+              normalize(uname) === nn)
+          ) {
+            best = m;
+            bestScore = 1;
+            secondScore = 0;
+            break;
+          }
+
+          const score = Math.max(
+            similarity(name, nick),
+            similarity(name, gname),
+            similarity(name, uname),
+          );
+
+          if (score > bestScore) {
+            secondScore = bestScore;
+            bestScore = score;
+            best = m;
+          } else if (score > secondScore) {
+            secondScore = score;
+          }
+        }
+
+        if (!best || bestScore < threshold) {
+          problems.push(`Unmatched: ${name}`);
+          continue;
+        }
+        if (bestScore - secondScore < ambGap) {
+          problems.push(`Ambiguous: ${name}`);
+          continue;
+        }
+
+        matched.set(name, best);
+        usedMemberIds.add(best.id);
+      }
+
+      // 4) STRICT: if any problems, do NOTHING else
+      if (problems.length > 0 || matched.size !== albionNames.length) {
+        const uniqueProblems = [...new Set(problems.filter(Boolean))];
+
+        const extracted = albionNames.length;
+        const matchedCount = matched.size;
+        const missing = extracted - matchedCount;
+
+        let out =
+          `❌ **Strict mode: no roles were added.**\n` +
+          `Battle: **${battleLabel}** | Guild: **${guildName}** | Role: **${role.name}**\n` +
+          `Extracted: **${extracted}** | Matched: **${matchedCount}** | Missing: **${missing}**\n\n` +
+          `**Problems (${uniqueProblems.length}):**\n- ${uniqueProblems.join("\n- ")}`;
+
+        if (out.length > 1900) out = out.slice(0, 1900) + "\n…(truncated)";
+        return message.channel.send(out);
+      }
+
+      // 5) All matched: add role to each (still safe)
+      let added = 0;
+      let alreadyHad = 0;
+
+      for (const member of matched.values()) {
+        if (member.roles.cache.has(role.id)) {
+          alreadyHad++;
+          continue;
+        }
+        await member.roles.add(role);
+        added++;
+        await sleep(800); // rate-limit friendly
+      }
+
+      // One final message
+      return message.channel.send(
+        `✅ Added **${role.name}** to **${added}** member(s). (${alreadyHad} already had it.)`,
+      );
     }
   } catch (e) {
     console.error("ERROR:", e?.message);
