@@ -1,8 +1,4 @@
-// botLogic.js
-
-// ------------------------------
 // Small helpers
-// ------------------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function normalize(s) {
@@ -51,9 +47,7 @@ function dedupeClean(names) {
   ];
 }
 
-// ------------------------------
 // AlbionBB parsing (NUXT)
-// ------------------------------
 function extractBattleIds(input) {
   const s = String(input || "").trim();
 
@@ -178,9 +172,7 @@ async function getGuildPlayersFromBattles(battleIds, guildName) {
   return [...out].filter(Boolean);
 }
 
-// ------------------------------
 // Mapping (STRICT) - shared by map-bb and map-bb-add-role
-// ------------------------------
 async function strictMapAlbionToDiscordMembers({ guild, albionNames }) {
   const threshold = 0.86;
   const ambGap = 0.06;
@@ -253,9 +245,7 @@ async function strictMapAlbionToDiscordMembers({ guild, albionNames }) {
   };
 }
 
-// ------------------------------
 // Role helpers
-// ------------------------------
 function assertRoleEditableByBot(role, me) {
   if (role.position >= me.roles.highest.position) {
     throw new Error("❌ That role is above (or equal to) my highest role.");
@@ -279,9 +269,7 @@ async function addRoleToMembers({ role, membersIterable }) {
   return { added, alreadyHad };
 }
 
-// ------------------------------
 // Command implementations
-// ------------------------------
 async function cmdAddRole({ message, args, PREFIX, me }) {
   const role = message.mentions.roles.first();
   const members = message.mentions.members;
@@ -485,9 +473,54 @@ async function cmdMapBbAddRole({
   );
 }
 
-// ------------------------------
-// Router export
-// ------------------------------
+// ------------------------------------------------------------
+// handleCommand()
+// Central router for all bot commands.
+// Called from index.js AFTER:
+//  - prefix parsing (cmd + args extracted)
+//  - basic guild/bot checks (no DMs, ignore bots)
+//  - permission checks (you + bot must have Manage Roles)
+//
+// Supported commands (all use the PREFIX from .env or default):
+//
+// 1) add-role
+//    Usage:   <PREFIX>add-role @Role @User1 @User2 ...
+//    What it does:
+//      - Adds the mentioned role to each mentioned user.
+//      - Skips users who already have the role.
+//      - Adds one-by-one with a short delay (rate-limit friendly).
+//
+// 2) clear-role
+//    Usage:   <PREFIX>clear-role @Role
+//    What it does:
+//      - Removes the mentioned role from EVERY member who has it.
+//      - Removes one-by-one with a short delay (rate-limit friendly).
+//
+// 3) map-bb
+//    Usage:   <PREFIX>map-bb <albionbb link | id | multi link | "id,id,..."> [guild name]
+//    Examples:
+//      - <PREFIX>map-bb https://europe.albionbb.com/battles/313321164 Romania Mare
+//      - <PREFIX>map-bb https://europe.albionbb.com/battles/multi?ids=1,2,3 Romania Mare
+//    What it does:
+//      - Fetches AlbionBB HTML for the battle(s) with a browser User-Agent.
+//      - Extracts the "__NUXT_DATA__" JSON, then pulls player names for the given guild.
+//      - STRICT matching: maps each Albion name to exactly ONE Discord member
+//        using nickname/globalName/username + fuzzy matching.
+//      - If ANY name is unmatched/ambiguous, it posts an error list and outputs no mapping.
+//      - If ALL match, it prints a "DiscordName (Albion: AlbionName)" list (names only).
+//
+// 4) map-bb-add-role
+//    Usage:   <PREFIX>map-bb-add-role <albionbb link | id | multi link | "id,id,..."> @Role [guild name]
+//    Example:
+//      - <PREFIX>map-bb-add-role https://europe.albionbb.com/battles/313321164 @pay1 Romania Mare
+//    What it does:
+//      - Runs the SAME strict mapping logic as map-bb (extract -> strict map).
+//      - STRICT all-or-nothing: if ANY mapping fails (unmatched/ambiguous),
+//        it adds NO roles and prints the problem list.
+//      - If ALL match, it adds the role to every matched Discord member (one-by-one).
+//
+// Note: Unknown commands are ignored (no reply).
+// ------------------------------------------------------------
 async function handleCommand({
   message,
   cmd,
@@ -503,7 +536,6 @@ async function handleCommand({
   if (cmd === "map-bb-add-role")
     return cmdMapBbAddRole({ message, args, PREFIX, DEFAULT_GUILD_NAME, me });
 
-  // unknown command -> ignore silently (or reply if you want)
   return;
 }
 
